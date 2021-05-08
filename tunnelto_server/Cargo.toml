@@ -38,3 +38,8 @@ rusoto_credential = "0.44.0"
 [dependencies.rusqlite]
 version = "0.21.0"
 features = ["bundled"]
+
+[features]
+default = ["dynamodb"]
+dynamodb = []
+sqlite = []
