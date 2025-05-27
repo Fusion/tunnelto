@@ -1,31 +1,29 @@
 pub mod console_log;
 pub use self::console_log::*;
 use super::*;
-use std::net::{SocketAddr};
-use warp::{Filter};
-use warp::http::Method;
-use warp::path::FullPath;
-use warp::http::HeaderMap;
-use futures::{Stream, StreamExt};
-use bytes::Buf;
-use uuid::Uuid;
-use http_body::Body;
 
-type HttpClient = hyper::Client<hyper::client::HttpConnector>;
+use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::StreamExt;
+use hyper::Uri;
+use std::net::SocketAddr;
+use std::vec;
+use uuid::Uuid;
+use warp::Filter;
 
 #[derive(Debug, Clone)]
 pub struct Request {
     id: String,
     status: u16,
     is_replay: bool,
-    path: String,
-    method: Method,
-    headers: HashMap<String, Vec<String>>,
+    path: Option<String>,
+    method: Option<String>,
+    headers: Vec<(String, String)>,
     body_data: Vec<u8>,
-    response_headers: HashMap<String, Vec<String>>,
+    response_headers: Vec<(String, String)>,
     response_data: Vec<u8>,
     started: chrono::NaiveDateTime,
     completed: chrono::NaiveDateTime,
+    entire_request: Vec<u8>,
 }
 
 impl Request {
@@ -43,64 +41,33 @@ lazy_static::lazy_static! {
     pub static ref REQUESTS:Arc<RwLock<HashMap<String, Request>>> = Arc::new(RwLock::new(HashMap::new()));
 }
 
-#[derive(Debug, Clone)]
-pub struct IntrospectionAddrs {
-    pub forward_address: SocketAddr,
-    pub web_explorer_address: SocketAddr,
-}
+pub fn start_introspect_web_dashboard(config: Config) -> SocketAddr {
+    let dash_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.dashboard_port));
 
-#[derive(Debug)]
-pub enum ForwardError{
-    IncomingRead,
-    InvalidURL,
-    InvalidRequest,
-    LocalServerError,
-}
-impl warp::reject::Reject for ForwardError {}
+    let css = warp::get().and(warp::path!("static" / "css" / "styles.css").map(|| {
+        let mut res = warp::http::Response::new(warp::hyper::Body::from(include_str!(
+            "../../static/css/styles.css"
+        )));
+        res.headers_mut().insert(
+            warp::http::header::CONTENT_TYPE,
+            warp::http::header::HeaderValue::from_static("text/css"),
+        );
+        res
+    }));
+    let logo = warp::get().and(warp::path!("static" / "img" / "logo.png").map(|| {
+        let mut res = warp::http::Response::new(warp::hyper::Body::from(
+            include_bytes!("../../static/img/logo.png").to_vec(),
+        ));
+        res.headers_mut().insert(
+            warp::http::header::CONTENT_TYPE,
+            warp::http::header::HeaderValue::from_static("image/png"),
+        );
+        res
+    }));
 
-pub fn start_introspection_server(config: Config) -> IntrospectionAddrs {
-    let local_addr = format!("localhost:{}", &config.local_port);
-
-    let http_client= HttpClient::new();
-
-    let get_client = move || {
-        let client = http_client.clone();
-        warp::any().map(move || client.clone()).boxed()
-    };
-
-    let intercept = warp::any()
-        .and(warp::any().map(move || local_addr.clone()))
-        .and(warp::method())
-        .and(warp::path::full())
-        .and(warp::header::headers_cloned())
-        .and(warp::body::stream())
-        .and(get_client())
-        .and_then(forward);
-
-    let (forward_address, intercept_server) = warp::serve(intercept).bind_ephemeral(SocketAddr::from(([0,0,0,0], 0)));
-    tokio::spawn(intercept_server);
-
-    let css = warp::get().and(warp::path!("static" / "css" / "styles.css")
-        .map(|| {
-            let mut res = warp::http::Response::new(hyper::Body::from(include_str!("../../static/css/styles.css")));
-            res.headers_mut().insert(
-                warp::http::header::CONTENT_TYPE,
-                warp::http::header::HeaderValue::from_static("text/css"),
-            );
-            res
-        }));
-    let logo = warp::get().and(warp::path!("static" / "img" / "logo.png")
-        .map(|| {
-            let mut res = warp::http::Response::new(hyper::Body::from(include_bytes!("../../static/img/logo.png").to_vec()));
-            res.headers_mut().insert(
-                warp::http::header::CONTENT_TYPE,
-                warp::http::header::HeaderValue::from_static("image/png"),
-            );
-            res
-        }));
-    let forward_clone = forward_address.clone();
-
-    let web_explorer = warp::get().and(warp::path::end()).and_then(inspector)
+    let web_explorer = warp::get()
+        .and(warp::path::end())
+        .and_then(inspector)
         .or(warp::get()
             .and(warp::path("detail"))
             .and(warp::path::param())
@@ -108,117 +75,125 @@ pub fn start_introspection_server(config: Config) -> IntrospectionAddrs {
         .or(warp::post()
             .and(warp::path("replay"))
             .and(warp::path::param())
-            .and(get_client())
-            .and_then(move |id, client| {
-                replay_request(id, client, forward_clone.clone())
-            }))
+            .and_then(move |id| replay_request(id, config.clone())))
         .or(css)
         .or(logo);
 
-    let (web_explorer_address, explorer_server) = warp::serve(web_explorer).bind_ephemeral(SocketAddr::from(([0,0,0,0], 0)));
+    let (web_explorer_address, explorer_server) =
+        warp::serve(web_explorer).bind_ephemeral(dash_addr);
     tokio::spawn(explorer_server);
 
-    IntrospectionAddrs { forward_address, web_explorer_address}
+    web_explorer_address
 }
 
-async fn forward(local_addr: String,
-                 method: Method,
-                 path: FullPath,
-                 headers: HeaderMap,
-                 mut body: impl Stream<Item = Result<impl Buf, warp::Error>> + Send + Sync + Unpin + 'static,
-                 client: HttpClient) -> Result<Box<dyn warp::Reply>, warp::reject::Rejection>
-{
-    let started = chrono::Utc::now().naive_utc();
+#[derive(Debug, Clone)]
+pub struct IntrospectChannels {
+    pub request: UnboundedSender<Vec<u8>>,
+    pub response: UnboundedSender<Vec<u8>>,
+}
 
-    let mut request_headers = HashMap::new();
-    headers.keys().for_each(|k| {
-        let values  = headers.get_all(k).iter().filter_map(|v| v.to_str().ok()).map(|s| s.to_owned()).collect();
-        request_headers.insert(k.as_str().to_owned(), values);
-    });
+pub fn introspect_stream() -> IntrospectChannels {
+    let id = Uuid::new_v4();
+    let (request_tx, request_rx) = unbounded::<Vec<u8>>();
+    let (response_tx, response_rx) = unbounded::<Vec<u8>>();
 
-    let mut collected:Vec<u8> = vec![];
+    tokio::spawn(async move { collect_stream(id, request_rx, response_rx).await });
 
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|e| {
-            log::error!("error reading incoming buffer: {:?}", e);
-            warp::reject::custom(ForwardError::IncomingRead)
-        })?.to_bytes();
+    IntrospectChannels {
+        request: request_tx,
+        response: response_tx,
+    }
+}
 
-        collected.extend_from_slice(chunk.as_ref())
+async fn collect_stream(
+    id: Uuid,
+    mut request_rx: UnboundedReceiver<Vec<u8>>,
+    mut response_rx: UnboundedReceiver<Vec<u8>>,
+) {
+    let started = chrono::Local::now().naive_local();
+    let mut collected_request: Vec<u8> = vec![];
+    let mut collected_response: Vec<u8> = vec![];
+
+    while let Some(next) = request_rx.next().await {
+        collected_request.extend(next);
     }
 
-    let url = format!("http://{}{}", local_addr, path.as_str());
+    while let Some(next) = response_rx.next().await {
+        collected_response.extend(next);
+    }
 
-    let mut request = hyper::Request::builder()
-        .method(method.clone())
-        .version(hyper::Version::HTTP_11)
-        .uri(url.parse::<hyper::Uri>().map_err(|e| {
-            log::error!("invalid incoming url: {}, error: {:?}", url, e);
-            warp::reject::custom(ForwardError::InvalidURL)
-        })?);
+    // collect the request
+    let mut request_headers = [httparse::EMPTY_HEADER; 100];
+    let mut request = httparse::Request::new(&mut request_headers);
 
-    for header in headers {
-        if let Some(header_name) = header.0 {
-            request = request.header(header_name, header.1)
+    let parts_len = match request.parse(collected_request.as_slice()) {
+        Ok(httparse::Status::Complete(len)) => len,
+        _ => {
+            warn!("incomplete request received");
+            return;
         }
-    }
+    };
+    let body_data = collected_request.as_slice()[parts_len..].to_vec();
 
-    // let _ = request.headers_mut().replace(&mut headers);
-    let request = request.body(hyper::Body::from(collected.clone())).map_err(|e| {
-        log::error!("failed to build request: {:?}", e);
-        warp::reject::custom(ForwardError::InvalidRequest)
-    })?;
+    // collect the response
+    let mut response_headers = [httparse::EMPTY_HEADER; 100];
+    let mut response = httparse::Response::new(&mut response_headers);
 
-    let response = client.request(request).await.map_err(|e| {
-        log::error!("local server error: {:?}", e);
-        warp::reject::custom(ForwardError::LocalServerError)
-    })?;
+    let parts_len = match response.parse(&collected_response.as_slice()) {
+        Ok(httparse::Status::Complete(len)) => len,
+        _ => 0,
+    };
+    let response_data = collected_response.as_slice()[parts_len..].to_vec();
 
-    let mut response_headers = HashMap::new();
-    response.headers().keys().for_each(|k| {
-        let values  = response.headers().get_all(k).iter().filter_map(|v| v.to_str().ok()).map(|s| s.to_owned()).collect();
-        response_headers.insert(k.as_str().to_owned(), values);
-    });
-
-    let (parts, mut body) = response.into_parts();
-
-    let mut response_data = vec![];
-    while let Some(next) = body.data().await {
-        let chunk = next.map_err(|e| {
-            log::error!("error reading local response: {:?}", e);
-            warp::reject::custom(ForwardError::LocalServerError)
-        })?;
-
-        response_data.extend_from_slice(&chunk);
-    }
+    console_log::log(&request, &response);
 
     let stored_request = Request {
-        id: Uuid::new_v4().to_string(),
-        status: parts.status.as_u16(),
-        path: path.as_str().to_owned(),
-        method,
-        headers: request_headers,
-        body_data: collected,
-        response_headers,
-        response_data: response_data.clone(),
+        id: id.to_string(),
+        path: request.path.map(String::from),
+        method: request.method.map(String::from),
+        headers: request_headers
+            .iter()
+            .filter(|h| *h != &httparse::EMPTY_HEADER)
+            .map(|h| {
+                (
+                    h.name.to_string(),
+                    std::str::from_utf8(h.value).unwrap_or("???").to_string(),
+                )
+            })
+            .collect(),
+        body_data,
+        status: response.code.unwrap_or(0),
+        response_headers: response_headers
+            .iter()
+            .filter(|h| *h != &httparse::EMPTY_HEADER)
+            .map(|h| {
+                (
+                    h.name.to_string(),
+                    std::str::from_utf8(h.value).unwrap_or("???").to_string(),
+                )
+            })
+            .collect(),
+        response_data,
         started,
-        completed: chrono::Utc::now().naive_utc(),
+        completed: chrono::Local::now().naive_local(),
         is_replay: false,
+        entire_request: collected_request,
     };
 
-    REQUESTS.write().unwrap().insert(stored_request.id.clone(), stored_request);
-
-    Ok(Box::new(warp::http::Response::from_parts(parts, response_data)))
+    REQUESTS
+        .write()
+        .unwrap()
+        .insert(stored_request.id.clone(), stored_request);
 }
 
 #[derive(Debug, Clone, askama::Template)]
-#[template(path="index.html")]
+#[template(path = "index.html")]
 struct Inspector {
-    requests: Vec<Request>
+    requests: Vec<Request>,
 }
 
 #[derive(Debug, Clone, askama::Template)]
-#[template(path="detail.html")]
+#[template(path = "detail.html")]
 struct InspectorDetail {
     request: Request,
     incoming: BodyData,
@@ -241,23 +216,28 @@ impl AsRef<BodyData> for BodyData {
 #[derive(Debug, Clone)]
 enum DataType {
     Json,
-    Unknown
+    Unknown,
 }
 
 async fn inspector() -> Result<Page<Inspector>, warp::reject::Rejection> {
-    let mut requests:Vec<Request> = REQUESTS.read().unwrap().values().map(|r| r.clone()).collect();
-    requests.sort_by(|a,b| b.completed.cmp(&a.completed));
+    let mut requests: Vec<Request> = REQUESTS
+        .read()
+        .unwrap()
+        .values()
+        .map(|r| r.clone())
+        .collect();
+    requests.sort_by(|a, b| b.completed.cmp(&a.completed));
     let inspect = Inspector { requests };
     Ok(Page(inspect))
 }
 
 async fn request_detail(rid: String) -> Result<Page<InspectorDetail>, warp::reject::Rejection> {
-    let request:Request = match REQUESTS.read().unwrap().get(&rid) {
+    let request: Request = match REQUESTS.read().unwrap().get(&rid) {
         Some(r) => r.clone(),
-        None => return Err(warp::reject::not_found())
+        None => return Err(warp::reject::not_found()),
     };
 
-    let detail = InspectorDetail{
+    let detail = InspectorDetail {
         incoming: get_body_data(&request.body_data),
         response: get_body_data(&request.response_data),
         request,
@@ -270,73 +250,66 @@ fn get_body_data(input: &[u8]) -> BodyData {
     let mut body = BodyData {
         data_type: DataType::Unknown,
         content: None,
-        raw: std::str::from_utf8(input).map(|s| s.to_string()).unwrap_or("No UTF-8 Data".to_string())
+        raw: std::str::from_utf8(input)
+            .map(|s| s.to_string())
+            .unwrap_or("No UTF-8 Data".to_string()),
     };
 
     match serde_json::from_slice::<serde_json::Value>(input) {
-        Ok(serde_json::Value::Object(map)) => {
+        Ok(v) => {
             body.data_type = DataType::Json;
-            body.content = serde_json::to_string_pretty(&map).ok();
-        },
-        Ok(serde_json::Value::Array(arr)) => {
-            body.data_type = DataType::Json;
-            body.content = serde_json::to_string_pretty(&arr).ok();
-        },
+            body.content = serde_json::to_string(&v).ok();
+        }
         _ => {}
     }
 
     body
 }
 
-async fn replay_request(rid: String, client: HttpClient, addr: SocketAddr) -> Result<Box<dyn warp::Reply>, warp::reject::Rejection> {
-    let request:Request = match REQUESTS.read().unwrap().get(&rid) {
+async fn replay_request(
+    rid: String,
+    config: Config,
+) -> Result<Box<dyn warp::Reply>, warp::reject::Rejection> {
+    let request: Request = match REQUESTS.read().unwrap().get(&rid) {
         Some(r) => r.clone(),
-        None => return Err(warp::reject::not_found())
+        None => return Err(warp::reject::not_found()),
     };
 
-    let url = format!("http://localhost:{}{}", addr.port(), &request.path);
-
-    let mut new_request = hyper::Request::builder()
-        .method(request.method)
-        .version(hyper::Version::HTTP_11)
-        .uri(url.parse::<hyper::Uri>().map_err(|e| {
-            log::error!("invalid incoming url: {}, error: {:?}", url, e);
-            warp::reject::custom(ForwardError::InvalidURL)
-        })?);
-
-    for (header, values) in &request.headers {
-        for v in values {
-            new_request = new_request.header(header, v)
+    let (tx, rx) = unbounded::<ControlPacket>();
+    tokio::spawn(async move {
+        // keep the rx alive
+        let mut rx = rx;
+        while let Some(_) = rx.next().await {
+            // do nothing
         }
+    });
+
+    let tx = local::setup_new_stream(config, tx, StreamId::generate()).await;
+
+    // send the data to the stream
+    if let Some(mut tx) = tx {
+        let _ = tx.send(StreamMessage::Data(request.entire_request)).await;
+    } else {
+        error!("failed to replay request: local tunnel could not connect");
+        return Err(warp::reject::not_found());
     }
 
-    let new_request = new_request.body(hyper::Body::from(request.body_data)).map_err(|e| {
-        log::error!("failed to build request: {:?}", e);
-        warp::reject::custom(ForwardError::InvalidRequest)
-    })?;
-
-    let _ = client.request(new_request).await.map_err(|e| {
-        log::error!("local server error: {:?}", e);
-        warp::reject::custom(ForwardError::LocalServerError)
-    })?;
-
-    let response = warp::http::Response::builder()
-        .status(warp::http::StatusCode::SEE_OTHER)
-        .header(warp::http::header::LOCATION, "/")
-        .body(b"".to_vec());
-
-    Ok(Box::new(response))
+    Ok(Box::new(warp::redirect(Uri::from_static("/"))))
 }
 
 struct Page<T>(T);
 
-impl <T> warp::reply::Reply for Page<T> where T:askama::Template + Send + 'static {
+impl<T> warp::reply::Reply for Page<T>
+where
+    T: askama::Template + Send + 'static,
+{
     fn into_response(self) -> warp::reply::Response {
         let res = self.0.render().unwrap();
 
-        warp::http::Response::builder().status(warp::http::StatusCode::OK).header(
-            warp::http::header::CONTENT_TYPE,
-            "text/html",
-        ).body(res.into()).unwrap()
+        warp::http::Response::builder()
+            .status(warp::http::StatusCode::OK)
+            .header(warp::http::header::CONTENT_TYPE, "text/html")
+            .body(res.into())
+            .unwrap()
     }
 }

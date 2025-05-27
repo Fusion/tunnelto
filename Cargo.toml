@@ -4,5 +4,11 @@ members = [
     "tunnelto_lib",
     "tunnelto",
     "tunnelto_server",
-    "sql"
 ]
+
+exclude = [
+    "tunnelto_proxy"
+]
+
+[profile.dev]
+split-debuginfo = "unpacked"
