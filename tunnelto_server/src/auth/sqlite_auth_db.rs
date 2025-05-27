@@ -140,6 +140,7 @@ impl AuthService for AuthDbService {
 impl AuthDbService {
     async fn get_account_id_for_auth_key(&self, auth_key: &str) -> Result<Uuid, Error> {
         let auth_key_hash = key_id(auth_key);
+        println!("Encrypted key: {:#?}", auth_key_hash);
 
         let conn:&Connection = &*self.connection.lock().unwrap();
         let row: Result<String, _> = conn.query_row(
